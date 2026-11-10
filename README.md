@@ -9,6 +9,7 @@ Benchmarks of local LLM inference on a Google Pixel 9 Pro XL using llama.cpp ins
 3. **Thermal throttling starts within a couple of minutes** at full load and has a bigger effect than thread count. Test order matters; whichever configuration runs first looks better.
 4. **Disabling Vulkan cooperative matrix ("matrix cores") on the Mali-G715 makes GPU prompt processing ~8× faster** (19 → 155 tok/s on Llama 3.2 1B).
 5. **CPU and GPU running separate models at the same time reach ~32 GB/s combined**, about **45% more total throughput** than the CPU alone.
+6. **Batching parallel requests nearly triples CPU generation throughput**: 4 simultaneous requests on Llama 3.2 1B give **78 tok/s in total** (vs 28 for one), with each request still at ~19.5 tok/s.
 
 ---
 
@@ -185,6 +186,34 @@ Combined effective bandwidth ≈ **32 GB/s**, above the CPU's ~22 GB/s ceiling, 
 
 **Practical meaning:** to run two models on one phone, put one on the CPU and one on the GPU. This does **not** speed up a single answer (splitting one model between CPU and GPU processes layers in sequence); it raises total throughput for parallel jobs.
 
+Note: `GGML_VK_DISABLE_COOPMAT=1` would not raise the GPU figure here. Cooperative matrix only affects batched prompt processing; single-stream generation was identical with it on and off (21.57 vs 21.63 tok/s, section 5).
+
+### 7. Batched generation: serving several requests at once (Llama 3.2 1B Q4_0, CPU, A720 pinned)
+
+Generation is memory-bound, so the CPU has spare compute while it waits for weights. Serving several requests at once lets each read of the weights produce a token for every request.
+
+```bash
+GGML_VK_VISIBLE_DEVICES= taskset -c 4-6 ./build/bin/llama-batched-bench -m MODEL.gguf -c 4096 -npp 128 -ntg 128 -npl 1,2,4,8 -t 3
+```
+
+| Parallel requests | Prompt (S_PP) | Total generation (S_TG) | Generation per request | Overall (S) |
+|---|---|---|---|---|
+| 1 | 176.30 | 27.95 | 27.95 | 48.25 |
+| 2 | 179.30 | 34.65 | 17.33 | 58.08 |
+| **4** | 182.53 | **78.08** | **19.52** | 109.37 |
+| 8 | 178.62 | 80.10 | 10.01 | 110.60 |
+
+(t/s; each request has a 128-token prompt and generates 128 tokens.)
+
+- **4 parallel requests is the sweet spot:** 2.8× the single-stream total, while each request still gets ~19.5 tok/s.
+- **At 8 the total plateaus** (~80 tok/s): compute, not memory, is now the limit, so extra requests only split the same output.
+- **2 requests gave little gain** (1.24×). A possible explanation is that llama.cpp's repacked ARM Q4_0 kernels process 4 rows at a time, so a batch of 2 falls back to a slower path. Not confirmed; if true, batch sizes in multiples of 4 matter.
+- 78 tok/s × 0.77 GB ≈ 60 GB/s "equivalent", well beyond the ~22 GB/s physical ceiling, because each weight read now serves several requests.
+
+Caveat: these are short conversations (128 + 128 tokens). Longer contexts add attention work and will reduce the gain.
+
+**Practical meaning:** `llama-server` serves parallel users the same way (its `-np` option). One phone handling 4 requests at ~20 tok/s each is far more useful for a server or worker fleet than one request at 28 tok/s.
+
 ---
 
 ## Limitations
@@ -199,6 +228,8 @@ Combined effective bandwidth ≈ **32 GB/s**, above the CPU's ~22 GB/s ceiling, 
 
 - **Power and energy per token** for each configuration (e.g. via `termux-battery-status` current readings, or an external USB power meter).
 - **Speculative decoding**: Llama 3.1 8B with Llama 3.2 1B as draft (the draft is ~6× faster than the target here).
+- **Batching plus the GPU**: a batched CPU model and a second model on the GPU at the same time, which could plausibly push total throughput towards ~100 tok/s on 1B.
+- **Batching at longer contexts** (e.g. 1,000+ token conversations) and with larger models (3B, 8B), and confirming why a batch of 2 underperforms.
 - **Snapdragon comparison** (e.g. Snapdragon 8 Elite / 8 Elite Gen 5 with Adreno and llama.cpp's OpenCL backend) using the same commands.
 - **Fan or passive cooling** vs none, to quantify sustained-performance gains.
 - Whether the cooperative-matrix slowdown affects other Mali GPUs.
